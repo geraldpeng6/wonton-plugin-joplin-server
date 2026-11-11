@@ -8,7 +8,7 @@ services:
     environment:
       POSTGRES_DB: joplin
       POSTGRES_USER: joplin
-      POSTGRES_password: ${WONTON_SECRET_POSTGRES}
+      POSTGRES_PASSWORD: ${WONTON_SECRET_POSTGRES}
     volumes:
       - ${WONTON_APP_DATA}/postgres:/var/lib/postgresql/data
     healthcheck:
@@ -31,11 +31,14 @@ services:
       # Joplin 客户端同步不读这个值：客户端直连局域网端口 22300（见 README），实测见 PR。
       APP_BASE_URL: ${WONTON_APP_URL}
       DB_CLIENT: pg
+      # 容器时钟跟宿主机走，NTP 对时在插件网络里连不上（pool.ntp.org 解析不了，进程直接退出）。
+      # 上游文档的关法：MAX_TIME_DRIFT 设 0 跳过 NTP 检查。
+      MAX_TIME_DRIFT: "0"
       POSTGRES_HOST: db
       POSTGRES_PORT: "5432"
       POSTGRES_DATABASE: joplin
       POSTGRES_USER: joplin
-      POSTGRES_password: ${WONTON_SECRET_POSTGRES}
+      POSTGRES_PASSWORD: ${WONTON_SECRET_POSTGRES}
       # 发信走核心的信箱（notify 权限）：注册确认、找回密码。核心的 SMTP 不加密、按来源认插件，
       # 显式关掉 STARTTLS/TLS；不发用户名密码（nodemailer 会在明文连接上做 AUTH，反而失败）。
       MAILER_ENABLED: "1"
