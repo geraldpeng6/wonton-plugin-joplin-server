@@ -74,7 +74,7 @@ configs:
     file: provision.js
 
 x-wonton:
-  spec: "0.12"
+  spec: "0.11"
   id: org.joplinapp.joplin-server
   version: 0.1.0
   kind: app
