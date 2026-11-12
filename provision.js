@@ -10,23 +10,49 @@
 const base = 'http://server:22300';
 const ownerEmail = process.env.WONTON_OWNER_EMAIL;
 const clientPassword = process.env.WONTON_SECRET_CLIENT;
+// Joplin 对每个请求做 origin 校验：请求自身的 host 必须等于 APP_BASE_URL 的 host
+// （routeUtils.ts isValidOrigin），否则连 /api/ping 都 404。服务间请求的 host 是
+// `server`，把 Host 头换成 APP_BASE_URL 的 host 才能调 API。
+const publicHost = new URL(process.env.APP_BASE_URL).host;
 if (!ownerEmail || !clientPassword) {
   console.error('缺少 WONTON_OWNER_EMAIL 或 WONTON_SECRET_CLIENT，核心没有注入');
   process.exit(1);
 }
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const http = require('http');
+
+function request(path, options) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      base + path,
+      { method: options.method || 'GET', headers: { host: publicHost, ...(options.headers || {}) } },
+      (res) => {
+        let text = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => { text += chunk; });
+        res.on('end', () => {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            const err = new Error(`${options.method || 'GET'} ${path} -> HTTP ${res.statusCode} ${text.slice(0, 200)}`);
+            err.status = res.statusCode;
+            reject(err);
+            return;
+          }
+          resolve(text ? JSON.parse(text) : null);
+        });
+      },
+    );
+    req.on('error', reject);
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+}
 
 async function call(path, options) {
-  const res = await fetch(base + path, options);
-  const text = await res.text();
-  if (!res.ok) {
-    const err = new Error(`${options.method || 'GET'} ${path} -> HTTP ${res.status} ${text.slice(0, 200)}`);
-    err.status = res.status;
-    throw err;
-  }
-  return text ? JSON.parse(text) : null;
+  const res = await request(path, options);
+  return res;
 }
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // 登录是探测语义：账号不存在、密码不对都返回 null，由调用方决定下一步；其余错误如实抛出。
 async function tryLogin(email, password) {
@@ -82,11 +108,12 @@ async function main() {
     console.error('改完账号后主人账号登录失败，可能密码或邮箱没有生效');
     process.exit(1);
   }
-  const me = await call(`/api/users/${newSession.user_id}`, {
+  const me = await call(`/api/users`, {
     headers: { 'x-api-auth': newSession.id },
   });
-  if (!me.is_admin || me.email !== ownerEmail) {
-    console.error(`改完的账号不对：email=${me.email} is_admin=${me.is_admin}`);
+  const mine = (me.items || []).filter((u) => u.email === ownerEmail);
+  if (mine.length !== 1 || !mine[0].is_admin) {
+    console.error(`改完的账号不对：能列用户的会话里找不到主人的管理员账号（${ownerEmail}）`);
     process.exit(1);
   }
 

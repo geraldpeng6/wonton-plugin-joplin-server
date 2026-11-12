@@ -30,6 +30,9 @@ services:
       # 网页登录后重定向到 ${APP_BASE_URL}/home，必须写主人浏览器访问的网关地址，否则网页登录回不来。
       # Joplin 客户端同步不读这个值：客户端直连局域网端口 22300（见 README），实测见 PR。
       APP_BASE_URL: ${WONTON_APP_URL}
+      # 冒烟探针从运行中的 server 容器读这两个值（init 容器跑完就退出，读不到）。
+      WONTON_OWNER_EMAIL: ${WONTON_OWNER_EMAIL}
+      WONTON_SECRET_CLIENT: ${WONTON_SECRET_CLIENT}
       DB_CLIENT: pg
       # 容器时钟跟宿主机走，NTP 对时在插件网络里连不上（pool.ntp.org 解析不了，进程直接退出）。
       # 上游文档的关法：MAX_TIME_DRIFT 设 0 跳过 NTP 检查。
@@ -48,8 +51,11 @@ services:
       MAILER_NOREPLY_EMAIL: ${WONTON_MAIL_FROM}
       MAILER_NOREPLY_NAME: Joplin
     healthcheck:
-      # 镜像里没有 wget/curl，用 Node 自带的 fetch 检查真的能应答。
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:22300/api/ping').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))"]
+      # 镜像里没有 wget/curl，用 Node 自带的 http 模块检查真的能应答。
+      # Joplin 对每个请求做 origin 校验：请求自身的 host 必须等于 APP_BASE_URL 的 host
+      # （routeUtils.ts isValidOrigin），否则 /api/ping 都 404。容器内探测是 127.0.0.1，
+      # 要把 Host 头换成 APP_BASE_URL 的 host 才算健康的探针。
+      test: ["CMD", "node", "-e", "const u=new URL(process.env.APP_BASE_URL);require('http').get({host:'127.0.0.1',port:22300,path:'/api/ping',headers:{host:u.host}},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
       interval: 30s
       timeout: 10s
       start_period: 120s
@@ -67,6 +73,7 @@ services:
     environment:
       WONTON_OWNER_EMAIL: ${WONTON_OWNER_EMAIL:?核心没有注入用户邮箱}
       WONTON_SECRET_CLIENT: ${WONTON_SECRET_CLIENT}
+      APP_BASE_URL: ${WONTON_APP_URL}
     configs:
       - source: provision
         target: /app/init.js
