@@ -115,6 +115,9 @@ x-wonton:
 
       The web page is the admin console; for everyday notes, use the Joplin app.
   release_notes: { zh: 首个版本。, en: Initial release. }
+  setup:
+    zh: 在手机或电脑上安装 Joplin 客户端（joplinapp.org），同步设置里选 Joplin Server，填插件详情里局域网一栏的地址、账号和密码。
+    en: Install the Joplin app on your phone or computer (joplinapp.org), choose Joplin Server in its sync settings, and enter the address, account and password from the plugin's LAN section.
   webui:
     service: server
     port: 22300
