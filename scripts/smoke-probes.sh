@@ -1,70 +1,86 @@
 # shellcheck shell=bash
-# Joplin Server：sso=none（应用自带登录）；清单没有 mcp。
-# Joplin 的 API 和网页同端口（22300），API 路由不认浏览器 Cookie（防 CSRF，源码 requestUtils.ts 的
-# contextSessionId：API 请求只认 x-api-auth 头），所以每个探针先用 lan.client 的账号
-# （主人邮箱+核心生成的密码）经网关 POST /api/sessions 拿会话，再带 x-api-auth 调接口。
-# 数据探针按 Joplin 的同步条目接口写一个原始条目（PUT /api/items/root:/<标记>:/content，
-# multipart 的 file 字段是条目内容），存的是 Postgres 里的用户数据，重装不删数据就还在。
-#
-# 变量别叫 state：shellcheck 把这份文件连着 probes.sh 一起分析，probes.sh 自己也读一个 dev.sh 提供的 state；
-# 子壳体函数（fn() ( … )）里给 state 赋值，SC2031 就报在 probes.sh 上，CI 红。
+# Joplin API 只认 x-api-auth，网页登录另走 session Cookie。数据探针上传真实序列化笔记，不用空的资源条目。
 
-_container() { # <插件 id> <服务名>：本实例里这个服务的容器
-  local inst="${SMOKE_INSTANCE:-}" args=(--filter "label=wonton.plugin=$1" --filter "label=wonton.service=$2")
-  if [[ -z "$inst" && -n "${SMOKE_BASE:-}" ]]; then
-    inst="${SMOKE_BASE#http://}"; inst="${inst%%.*}"
-  fi
-  [[ -z "$inst" ]] || args+=(--filter "label=wonton.instance=${inst//-/}")
-  docker ps --format '{{.Names}}' "${args[@]}" | head -1
+_server() {
+  [[ -n "${SMOKE_INSTANCE:-}" ]] || { echo '缺少 SMOKE_INSTANCE，不能定位本实例'; return 1; }
+  local containers
+  containers="$(docker ps --format '{{.Names}}' \
+    --filter "label=wonton.instance=$SMOKE_INSTANCE" \
+    --filter "label=wonton.plugin=$SMOKE_PLUGIN_ID" --filter 'label=wonton.service=server')" || return 1
+  [[ -n "$containers" && "$containers" != *$'\n'* ]] || { echo '找不到唯一的本实例 server 容器'; return 1; }
+  printf '%s' "$containers"
 }
 
-_api_session() { # 登录 lan.client 的账号，标准输出会话 token；失败输出错误并以非 0 退出
-  local c email pw resp
-  c="$(_container "$SMOKE_PLUGIN_ID" server)" || { echo "找不到 server 容器"; return 1; }
-  email="$(docker exec "$c" printenv WONTON_OWNER_EMAIL)" || { echo "server 容器里没有 WONTON_OWNER_EMAIL"; return 1; }
-  pw="$(docker exec "$c" printenv WONTON_SECRET_CLIENT)" || { echo "server 容器里没有 WONTON_SECRET_CLIENT"; return 1; }
-  resp="$(web_get /api/sessions -X POST -H 'Content-Type: application/json' \
-    --data "{\"email\":\"$email\",\"password\":\"$pw\"}")" \
-    || { echo "POST /api/sessions 失败：$resp"; return 1; }
-  jq -er '.id // empty' <<<"$resp" || { echo "登录没有返回会话：$(head -c 200 <<<"$resp")"; return 1; }
+_admin_password() {
+  local container
+  container="$(_server)" || return 1
+  docker exec "$container" printenv DEFAULT_ADMIN_PASSWORD
 }
 
-web_assert() { grep -qi 'joplin'; }   # 登录页是应用的真实页面（根路径重定向到 /login）
-
-identity_check() { # 会话要拿得到，而且认出的是主人的管理员账号（一次性服务改写过的那个）
-  local c token users email
-  c="$(_container "$SMOKE_PLUGIN_ID" server)" || { echo "找不到 server 容器"; return 1; }
-  email="$(docker exec "$c" printenv WONTON_OWNER_EMAIL)" || return 1
-  token="$(_api_session)" || { echo "$token"; return 1; }
-  users="$(web_get /api/users -H "x-api-auth: $token")" \
-    || { echo "GET /api/users 失败：$users"; return 1; }
-  jq -e --arg e "$email" '[.items[] | select(.email == $e)] | length == 1 and .[0].is_admin == true' <<<"$users" >/dev/null \
-    || { echo "登录到的不是主人的管理员账号：$(head -c 200 <<<"$users")"; return 1; }
+_api_session() {
+  local pw response
+  pw="$(_admin_password)" || return 1
+  response="$(web_get /api/sessions --fail-with-body -X POST -H 'Content-Type: application/json' \
+    --data "$(jq -nc --arg pw "$pw" '{email:"admin@localhost",password:$pw}')")" || {
+    echo 'Joplin 初始管理员登录失败'; return 1;
+  }
+  jq -er '.id' <<<"$response"
 }
 
-# 合并前验证升级、重装不丢用户数据：写一个带随机标记的同步条目，标记存进标记文件。
-marker_file() { # SMOKE_STATE 在套件里是状态目录（e2e 传的是标记文件本身），标记放对应路径
-  if [[ -d "$SMOKE_STATE" ]]; then printf '%s' "$SMOKE_STATE/joplin-marker"; else printf '%s' "${SMOKE_STATE}.marker"; fi
+web_assert() { grep -qi 'joplin'; }
+
+identity_check() {
+  local token users pw code location headers
+  token="$(_api_session)" || return 1
+  users="$(web_get /api/users --fail-with-body -H "x-api-auth: $token")" || return 1
+  jq -e '[.items[] | select(.email == "admin@localhost" and (.is_admin == 1 or .is_admin == true))] | length == 1' \
+    <<<"$users" >/dev/null || { echo 'Joplin 会话没有识别初始管理员'; return 1; }
+  pw="$(_admin_password)" || return 1
+  headers="$(mktemp)"
+  code="$(web_get /login -o /dev/null -w '%{http_code}' -D "$headers" -c "$SMOKE_JAR" \
+    -H "Origin: $SMOKE_WEB_ORIGIN" --data-urlencode email=admin@localhost --data-urlencode "password=$pw")" || {
+    rm -f "$headers"; return 1;
+  }
+  location="$(tr -d '\r' <"$headers" | grep -i '^location:')"
+  rm -f "$headers"
+  [[ "$code" == 302 && "$location" == *'/admin/dashboard' ]] || {
+    echo "Joplin 网页登录没有跳转到管理页（HTTP $code）"; return 1;
+  }
+  web_get /admin/dashboard --fail-with-body | grep -qi 'joplin'
+}
+
+_note() {
+  local id="$1"
+  printf 'Wonton smoke %s\n\nWonton note body %s\n\nid: %s\nparent_id: \ncreated_time: 2026-01-01T00:00:00.000Z\nupdated_time: 2026-01-01T00:00:00.000Z\nuser_created_time: 2026-01-01T00:00:00.000Z\nuser_updated_time: 2026-01-01T00:00:00.000Z\nis_conflict: 0\nis_todo: 0\norder: 0\nencryption_cipher_text: \nencryption_applied: 0\nmarkup_language: 1\nis_shared: 0\ndeleted_time: 0\ntype_: 1' "$id" "$id" "$id"
 }
 
 data_write() {
-  local token marker resp
-  token="$(_api_session)" || { echo "$token"; return 1; }
-  marker="wonton-smoke-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
-  # root:/<名字>:/content：名字不带 .md 时按原始内容存（Joplin 资源 blob 的同步方式），不用构造序列化的笔记。
-  resp="$(web_get "/api/items/root:/$marker:/content" -X PUT -H "x-api-auth: $token" -F "file=$marker")" \
-    || { echo "PUT 条目失败：$resp"; return 1; }
-  jq -e --arg m "$marker" '.id != null and .name == $m' <<<"$resp" >/dev/null \
-    || { echo "PUT 返回的不是这条条目：$(head -c 200 <<<"$resp")"; return 1; }
-  printf '%s' "$marker" >"$(marker_file)"
+  local token marker response note
+  token="$(_api_session)" || return 1
+  marker="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+  note="$(mktemp)"
+  _note "$marker" >"$note"
+  response="$(web_get "/api/items/root:/$marker.md:/content" --fail-with-body -X PUT \
+    -H "x-api-auth: $token" -F "file=@$note;filename=$marker.md;type=text/plain")" || {
+    rm -f "$note"; return 1;
+  }
+  rm -f "$note"
+  jq -e --arg name "$marker.md" '.id != null and .name == $name' <<<"$response" >/dev/null || return 1
+  printf '%s' "$marker" >"$SMOKE_STATE"
 }
 
-data_check() { # 同步条目还在，内容是那个标记
+data_check() {
   local token marker got
-  token="$(_api_session)" || { echo "$token"; return 1; }
-  marker="$(cat "$(marker_file)")"
-  [[ -n "$marker" ]] || { echo "标记文件里没有标记"; return 1; }
-  got="$(web_get "/api/items/root:/$marker:/content" -H "x-api-auth: $token")" \
-    || { echo "读回条目失败：$got"; return 1; }
-  grep -qF "$marker" <<<"$got" || { echo "条目内容不是 $marker：$(head -c 200 <<<"$got")"; return 1; }
+  token="$(_api_session)" || return 1
+  marker="$(cat "$SMOKE_STATE")" || return 1
+  [[ "$marker" =~ ^[a-f0-9]{32}$ ]] || { echo '笔记标记无效'; return 1; }
+  got="$(web_get "/api/items/root:/$marker.md:/content" --fail-with-body -H "x-api-auth: $token")" || return 1
+  python3 - "$marker" "$got" <<'PY'
+import sys
+marker, content = sys.argv[1:]
+text, metadata = content.rsplit("\n\n", 1)
+fields = dict(line.split(": ", 1) for line in metadata.splitlines())
+if text != f"Wonton smoke {marker}\n\nWonton note body {marker}" or fields.get("id") != marker or fields.get("type_") != "1":
+    sys.exit("读回的笔记标题、正文或标识与写入的不一致")
+PY
 }

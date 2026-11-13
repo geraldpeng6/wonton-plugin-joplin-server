@@ -1,67 +1,40 @@
-# 云吞插件：笔记同步（Joplin Server）
+# 笔记同步（Joplin Server）
+
+像有道云笔记，把手机和电脑上的 Joplin 笔记存到家里，换设备接着写。网页是账号管理页，写笔记用免费的 [Joplin 应用](https://joplinapp.org)。
 
 开发流程见[插件开发指南](https://github.com/wontonapp/wonton-docs/blob/main/develop.md)。
 
-Joplin 官方的同步服务端：手机、电脑上的 Joplin 笔记本把笔记同步到你家里的服务器，换设备接着写。
-网页（经核心网关）是管理页，应用自带登录；Joplin 客户端连局域网端口 22300（`lan.client`，默认关，
-在插件详情里打开"在局域网开放"后显示地址和账号）。
-
 ## 用法
 
-1. 在手机或电脑上安装免费的 [Joplin](https://joplinapp.org) 应用。
-2. 在云吞的插件详情里打开"在局域网开放"，复制显示的地址、账号和密码。
-3. 在 Joplin 应用的 设置 → 同步 里选择"Joplin Server"，把地址、账号、密码填进去，点"检查同步配置"。
+1. 在云吞的插件详情里查看“Joplin 初始密码”，用 `admin@localhost` 登录插件网页。可以在 Joplin 管理页修改邮箱、密码或创建普通账号。
+2. 在手机或电脑上安装 Joplin，在云吞里打开这个应用的客户端入口，复制显示的地址。
+3. 在 Joplin 的“设置 → 同步”选择“Joplin Server”，填写地址和自己的 Joplin 账号、密码，点“检查同步配置”。
 
-## 插件行为
+云吞只显示客户端地址，不代替 Joplin 管理账号。改过初始密码后，插件详情里的值不会跟着变；使用自己改过的密码。
 
-- 两个服务：`server`（joplin/server，端口 22300）和 `db`（Postgres，数据卷在应用数据目录的 `postgres/`）。
-  上游官方 compose 就是这两个服务；镜像按清单列表（index）摘要固定。
-- 一次性 `provision` 服务：Joplin Server 首次启动自带默认管理员 `admin@localhost`/`admin`，
-  不能留着。它调 Joplin 的 API（`POST /api/sessions`、`PATCH /api/users/:id`）把默认管理员的邮箱改成
-  主人的内部邮箱、密码换成核心生成的密码——Joplin 客户端按邮箱+密码登录，改完的账号就是 `lan.client`
-  显示的账号。脚本幂等：重装、重建容器时主人账号直接登录通过就跳过，改写没有生效会报错退出。
-- `APP_BASE_URL` 用注入的网页地址（`WONTON_APP_URL`）：Joplin 的网页登录后会重定向到 `${APP_BASE_URL}/home`，
-  写错网页登录回不来。Joplin 客户端的同步不读这个值（客户端直连局域网端口），两者地址不同不影响同步（实测见 PR）。
-- 自助注册上游默认就关（`SIGNUP_ENABLED` 默认 false）；账号由一次性服务建，`lan.client` 显示给用户。
-- 发信（找回密码、共享邀请）接核心的信箱（`notify` 权限）：`MAILER_*` 指向 `WONTON_SMTP_HOST/PORT`，
-  `MAILER_SECURITY=none`（核心的 SMTP 不加密）；收件人只能是家里的人，外部地址会被拒收。
-- 网页上能分享笔记出去的外链功能没有外部入口（分享链接指向网页地址，收件人没有云吞会话打不开）。
+## 地址与账号
 
-## 数据存在哪
+- 使用上游官方 `joplin/server:3.7.5` 和 `postgres:16.15`，均按清单列表摘要固定，不修改上游源码。
+- `APP_BASE_URL` 使用核心注入的 `WONTON_EXTERNAL_URL`；`clients.http.single_host: true` 让各入口转发给 Joplin 的 `Host` 与规范地址一致。入口开关改变地址时，由核心重建应用。
+- Joplin 3.7.5 的 `API_BASE_URL`、`USER_CONTENT_BASE_URL` 不设时都使用 `APP_BASE_URL`，无需第二个域名或子路径。上游的[配置定义](https://github.com/laurent22/joplin/blob/server-v3.7.5/packages/server/src/config.ts)和[分享地址检查](https://github.com/laurent22/joplin/blob/server-v3.7.5/packages/server/src/models/ShareModel.ts)均支持同址；不把页面里出现的两个配置项当成必须两个入口。
+- 初始管理员密码经上游 `DEFAULT_ADMIN_PASSWORD` 设置，来自核心生成的 `client` 密钥。后续重建不覆盖用户修改过的账号。自助注册显式关闭。
+- 客户端入口用 `auth.app`，由 Joplin 自己验证邮箱和密码。`setup-done.js` 使用镜像自带的 PostgreSQL 驱动和密码比较函数，只读确认已存在启用的管理员且没有管理员仍用 `admin` 密码；数据库不可用返回“不确定”，不放行入口。
+- 管理页和分享内容共用一个来源，没有独立域名隔离。给别人分享笔记前确认内容确实可以公开；只在家里打开入口时，外面的人不能访问分享链接。
+- 找回密码和邀请邮件经云吞的信箱发送，只收发给家里人的内部邮箱。初始 `admin@localhost` 不能收这类信；需要时先在 Joplin 中设成自己的云吞内部邮箱。
+- 容器使用宿主机时钟，按上游支持的 `MAX_TIME_DRIFT=0` 关闭插件网络内不可达的 NTP 探测，不额外申请出网权限。
 
-- 笔记内容、账号都在 Postgres 里：应用数据目录的 `postgres/`（宿主机上）。没有别的数据目录。
-- 备份：备份整个 `postgres/` 目录要先停止插件（或用 `pg_dump`），目录在服务运行时直接复制可能不一致。
+## 数据
 
-## 已知限制
+笔记、账号和同步状态都在应用数据目录的 `postgres/`。备份时先停止插件再复制整个目录，或使用 PostgreSQL 的 `pg_dump`；运行中直接复制可能不一致。PostgreSQL 大版本升级需要手动迁移，依赖更新配置不自动跨大版本。
 
-- Joplin Server 是 "Joplin Server Personal Use License"，只许个人使用，不是开源许可证（全文见
-  [NOTICE](NOTICE)）；笔记数据本身在你自己的服务器上，客户端应用（Joplin）是开源的。
-- 从外部网络（不在家里、也不经云吞的隧道）同步：需要自己把 22300 端口映射出去，本插件没有申请这个能力。
-- Postgres 大版本升级要手动迁移数据（Dependabot 的配置里已忽略大版本）。
+## 许可证
 
-## 先跑起来
+Joplin Server 使用 [Joplin Server Personal Use License](https://github.com/laurent22/joplin/blob/server-v3.7.5/packages/server/LICENSE.md)，限个人非商业用途，不是开源许可证。安装和使用前由主人自行阅读并决定是否接受；本插件不代为接受许可。Joplin 客户端是开源的。
 
-```bash
-scripts/dev.sh up
-scripts/dev.sh install
-```
+## 验证
 
-`up` 在本机起一套云吞并打印它的地址，用 `scripts/dev.sh token` 输出的用户令牌登录；`install` 列出插件要的
-权限，确认后装上。打开插件网页是 Joplin 的登录页，用 `lan.client` 显示的账号（或改密码前的初始账号）
-登录进管理页。
+`scripts/smoke-probes.sh` 验证登录页、管理员 API 会话、网页表单登录，以及真实 Joplin 笔记的上传和读取。数据探针用于套件的升级与重装保数据检查；未声明 MCP 工具。
 
-## 仓库里有什么
+## 图标
 
-| 路径 | 内容 |
-| --- | --- |
-| `docker-compose.yml` | 插件本身：compose 加上 `x-wonton` 清单 |
-| `provision.js` | 一次性 `provision` 服务的脚本：改写默认管理员，建主人账号 |
-| `icon.svg` | 插件图标（Joplin 官方标志） |
-| `screenshots/` | 商店详情页里的截图 |
-| `scripts/smoke-probes.sh` | `scripts/dev.sh smoke` 的网页、身份、数据探测 |
-
-## 图标来源与授权
-
-`icon.svg` 原样使用 Joplin 官方标志（上游仓库 Assets/JoplinIcon.svg），未改动图形；来源、版权（上游声明
-未经许可不得使用）、Joplin Server 许可证全文和商标说明见 [NOTICE](NOTICE)。Joplin 名称和标志是
-Joplin 项目（Laurent Cozic）的商标；本插件是独立维护的云吞插件包，不代表上游官方出品、合作或背书。
+`icon.svg` 原样使用 [Joplin 官方标志](https://github.com/laurent22/joplin/blob/server-v3.7.5/Assets/JoplinIcon.svg)，来源、版权、许可全文和商标说明见 [NOTICE](NOTICE)。Joplin 名称和标志属于上游，本插件不代表官方合作或背书。
