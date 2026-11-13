@@ -1,61 +1,86 @@
 # shellcheck shell=bash
-# scripts/smoke.sh 的一项一项探测，跟着插件走。没写的项会 FAIL 并给出写法，不会默认放行。
-#
-# 变量别叫 state：shellcheck 把这份文件连着 probes.sh 一起分析，probes.sh 自己也读一个 dev.sh 提供的 state；
-# 子壳体函数（fn() ( … )）里给 state 赋值，SC2031 就报在 probes.sh 上，CI 红。
-#
-# 变量：SMOKE_WEB_URL 是应用的网页入口（套件已去尾斜杠，但可能带路径，比如 SSO 登录页）；
-#       拼 API 路径用 SMOKE_WEB_ORIGIN（只有 scheme://host:port，入口的路径不掺进来），别直接接在 SMOKE_WEB_URL 后面。
-#
-# 页面：web_assert 从标准输入读页面，命中的确是应用的真实页面时返回 0。
-# 身份：identity_check 只证明身份：用应用自己的“当前用户”接口断言认出的是用户管理员，不碰应用里的数据。
-#       数据断言（是否配置过、有几条、内容对不对）全部交给 data_write / data_check：冒烟第 1 项会先装升级
-#       起点写数据，身份探针再断言“数据目录是空的”就会红。接口回字段时也只看类型（如 configured 是布尔、
-#       nodes 是数字），值和条数留给 data_check。
-#       没有用户体系时写 IDENTITY_NA=1，并在 SMOKE_NOTE 里写原因。dweb / web_get 是带用户会话的请求助手，可继续走应用自己的登录链。
-#       SSO 登录跳转不用自己写表单逻辑：dweb --sso 会从清单 webui.path 的入口出发（没写就是 /），提交核心
-#       登录页的 JS 自动表单并跟完重定向，返回的页面已带应用的登录态。
-# 工具：MCP_TOOL 写一个只读工具名（可带插件前缀），MCP_ARGS 是 JSON 参数；mcp_assert 从标准输入读调用结果。
-#       要断言多个工具时改成写 mcp_check；调用前要备数据时写 before_mcp。
-# 通知房间：申请了 notify 的插件把通知交给核心，核心以核心账号发进和主人的“Wonton”私聊。
-#       探针以主人身份读这个房间：probes_owner_room_wait <超时秒> <要找的文字> 等到开始之后发来的、包含这段文字的
-#       消息就返回 0，超时列出看到的最新消息并返回非 0。要先把等待挂到后台再发通知，否则消息可能在等待开始前就到：
-#         room_wait() {
-#           local marker="probe-$RANDOM" url
-#           url="$(docker exec "wonton-$SMOKE_INSTANCE--${SMOKE_PLUGIN_ID//./-}--web" printenv WONTON_NOTIFY_URL)"
-#           probes_owner_room_wait 120 "$marker" & local pid=$!
-#           docker exec "wonton-$SMOKE_INSTANCE--${SMOKE_PLUGIN_ID//./-}--web" wget -q -O /dev/null \
-#             --header 'Content-Type: application/json' --post-data "{\"title\":\"$marker\"}" "$url"
-#           wait "$pid"
-#         }
-#       上面的 web 换成插件里能发 HTTP 的服务；wget 换成那个服务里有的客户端。
-# 数据：合并前要验证“升级/重装不丢用户数据”时写 data_write 和 data_check（两个都写才跑）：data_write 用随机标记写
-#       一条数据并把标记原样存进 $SMOKE_STATE，data_check 读回标记去应用里找，对不上就打印看到了什么并返回非 0。
-#       应用不存用户数据时写 DATA_NA=1（两项记 N/A）。
-# 装之前要准备（如先配出口代理）：写 before_install。
+# Joplin API 只认 x-api-auth，网页登录另走 session Cookie。数据探针上传真实序列化笔记，不用空的资源条目。
 
-web_assert() { grep -q '你好'; }   # 示例页的标题
-
-identity_check() { # 页面回显的就是网关注入的用户名；示例页不存数据，也不拿数据判断身份
-  local page
-  page="$(dweb /)" || { echo "页面失败：$page"; return 1; }
-  grep -qF "你好，$SMOKE_OWNER" <<<"$page" || { echo "页面没回显用户 $SMOKE_OWNER：$(head -c 120 <<<"$page")"; return 1; }
+_server() {
+  [[ -n "${SMOKE_INSTANCE:-}" ]] || { echo '缺少 SMOKE_INSTANCE，不能定位本实例'; return 1; }
+  local containers
+  containers="$(docker ps --format '{{.Names}}' \
+    --filter "label=wonton.instance=$SMOKE_INSTANCE" \
+    --filter "label=wonton.plugin=$SMOKE_PLUGIN_ID" --filter 'label=wonton.service=server')" || return 1
+  [[ -n "$containers" && "$containers" != *$'\n'* ]] || { echo '找不到唯一的本实例 server 容器'; return 1; }
+  printf '%s' "$containers"
 }
 
-# 数据：合并前要验证“升级/重装不丢用户数据”时写 data_write 和 data_check（两个都写才跑）：
-#   data_write 用随机标记写一条数据，把标记原样覆盖写进 $SMOKE_STATE（一个已建好的空文件，不是目录）；data_check 读回标记、去应用里找，
-#   找不到就打印看到了什么并返回非 0。
-# 应用不存用户数据时写 DATA_NA=1（两项记 N/A）。模板的示例页不存数据，所以这里是不适用。
-# 数据要写进插件容器时（Agent 插件的工作区标记等），容器名别自己拼：钩子契约里没有 SMOKE_SLUG，e2e 套件的
-# data_write 又跑在实例名导出之前，拼出来的名字缺段（No such container）；Bot 服务（清单声明了 bots）每个 Bot
-# 一组容器，名字还带 --<Bot 名> 后缀。按核心打的标签找，插件自带 smoke 和 e2e 套件两个运行环境都成立
-# （实例名没导出时按 SMOKE_BASE 的主机名第一段推）：
-#   _container() { # <插件 id> <服务名>：本实例里这个服务的容器
-#     local inst="${SMOKE_INSTANCE:-}" args=(--filter "label=wonton.plugin=$1" --filter "label=wonton.service=$2")
-#     if [[ -z "$inst" && -n "${SMOKE_BASE:-}" ]]; then
-#       inst="${SMOKE_BASE#http://}"; inst="${inst%%.*}"
-#     fi
-#     [[ -z "$inst" ]] || args+=(--filter "label=wonton.instance=${inst//-/}")
-#     docker ps --format '{{.Names}}' "${args[@]}" | head -1
-#   }
-export DATA_NA=1
+_admin_password() {
+  local container
+  container="$(_server)" || return 1
+  docker exec "$container" printenv DEFAULT_ADMIN_PASSWORD
+}
+
+_api_session() {
+  local pw response
+  pw="$(_admin_password)" || return 1
+  response="$(web_get /api/sessions --fail-with-body -X POST -H 'Content-Type: application/json' \
+    --data "$(jq -nc --arg pw "$pw" '{email:"admin@localhost",password:$pw}')")" || {
+    echo 'Joplin 初始管理员登录失败'; return 1;
+  }
+  jq -er '.id' <<<"$response"
+}
+
+web_assert() { grep -qi 'joplin'; }
+
+identity_check() {
+  local token users pw code location headers
+  token="$(_api_session)" || return 1
+  users="$(web_get /api/users --fail-with-body -H "x-api-auth: $token")" || return 1
+  jq -e '[.items[] | select(.email == "admin@localhost" and (.is_admin == 1 or .is_admin == true))] | length == 1' \
+    <<<"$users" >/dev/null || { echo 'Joplin 会话没有识别初始管理员'; return 1; }
+  pw="$(_admin_password)" || return 1
+  headers="$(mktemp)"
+  code="$(web_get /login -o /dev/null -w '%{http_code}' -D "$headers" -c "$SMOKE_JAR" \
+    -H "Origin: $SMOKE_WEB_ORIGIN" --data-urlencode email=admin@localhost --data-urlencode "password=$pw")" || {
+    rm -f "$headers"; return 1;
+  }
+  location="$(tr -d '\r' <"$headers" | grep -i '^location:')"
+  rm -f "$headers"
+  [[ "$code" == 302 && "$location" == *'/admin/dashboard' ]] || {
+    echo "Joplin 网页登录没有跳转到管理页（HTTP $code）"; return 1;
+  }
+  web_get /admin/dashboard --fail-with-body | grep -qi 'joplin'
+}
+
+_note() {
+  local id="$1"
+  printf 'Wonton smoke %s\n\nWonton note body %s\n\nid: %s\nparent_id: \ncreated_time: 2026-01-01T00:00:00.000Z\nupdated_time: 2026-01-01T00:00:00.000Z\nuser_created_time: 2026-01-01T00:00:00.000Z\nuser_updated_time: 2026-01-01T00:00:00.000Z\nis_conflict: 0\nis_todo: 0\norder: 0\nencryption_cipher_text: \nencryption_applied: 0\nmarkup_language: 1\nis_shared: 0\ndeleted_time: 0\ntype_: 1' "$id" "$id" "$id"
+}
+
+data_write() {
+  local token marker response note
+  token="$(_api_session)" || return 1
+  marker="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+  note="$(mktemp)"
+  _note "$marker" >"$note"
+  response="$(web_get "/api/items/root:/$marker.md:/content" --fail-with-body -X PUT \
+    -H "x-api-auth: $token" -F "file=@$note;filename=$marker.md;type=text/plain")" || {
+    rm -f "$note"; return 1;
+  }
+  rm -f "$note"
+  jq -e --arg name "$marker.md" '.id != null and .name == $name' <<<"$response" >/dev/null || return 1
+  printf '%s' "$marker" >"$SMOKE_STATE"
+}
+
+data_check() {
+  local token marker got
+  token="$(_api_session)" || return 1
+  marker="$(cat "$SMOKE_STATE")" || return 1
+  [[ "$marker" =~ ^[a-f0-9]{32}$ ]] || { echo '笔记标记无效'; return 1; }
+  got="$(web_get "/api/items/root:/$marker.md:/content" --fail-with-body -H "x-api-auth: $token")" || return 1
+  python3 - "$marker" "$got" <<'PY'
+import sys
+marker, content = sys.argv[1:]
+text, metadata = content.rsplit("\n\n", 1)
+fields = dict(line.split(": ", 1) for line in metadata.splitlines())
+if text != f"Wonton smoke {marker}\n\nWonton note body {marker}" or fields.get("id") != marker or fields.get("type_") != "1":
+    sys.exit("读回的笔记标题、正文或标识与写入的不一致")
+PY
+}

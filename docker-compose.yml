@@ -1,78 +1,133 @@
-# 示例插件：nginx 显示一个网页，向登录的人问好。改成自己的应用见 https://github.com/wontonapp/wonton-docs/blob/main/develop.md#写插件。
+# Joplin 笔记同步：Joplin Server 加 Postgres，笔记在手机、电脑之间同步。
+# 网页和 Joplin 客户端共用规范对外地址；入口由主人在云吞里按需开启。
+# 上游镜像按清单列表（index）摘要固定；Joplin Server 是 "Joplin Server Personal Use License"，见 NOTICE。
 services:
-  web:
-    # 镜像按摘要固定（多架构镜像写清单列表的摘要），标签只给人看。
-    image: nginx:1.31.8-alpine@sha256:713fc2ebfd92e8217db451477182ee91944b123d2b1ee9fd5a8c6e91ca6c3a11
+  db:
+    # 上游官方 compose 用 postgres:16；数据卷保留在 ${WONTON_APP_DATA}，大版本升级要手动迁移。
+    image: postgres:16.15@sha256:f9a7b9ebf6f56201f949db745e47bc423c0f0f8294bafe991cc10bf74b029657
     environment:
-      # 网关代登录：SSI 回显的 Remote-User 只信核心带来的。官方镜像启动时对 templates 目录里的
-      # *.template 做 envsubst，把下面的地址换进 nginx 配置（见 web/default.conf.template）。
-      WONTON_CORE_ADDRESS: ${WONTON_CORE_ADDRESS}
-    # 包里的文件经 configs 交给容器（核心在启动前写进去），不能用卷挂载。
-    configs:
-      - source: site
-        target: /etc/nginx/templates/default.conf.template
-      - source: page
-        target: /usr/share/nginx/html/index.html
-      - source: tokens
-        target: /usr/share/nginx/html/tokens.css
+      POSTGRES_DB: joplin
+      POSTGRES_USER: joplin
+      POSTGRES_PASSWORD: ${WONTON_SECRET_POSTGRES}
+    volumes:
+      - ${WONTON_APP_DATA}/postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      test: ["CMD-SHELL", "pg_isready -U joplin -d joplin"]
       interval: 30s
       timeout: 5s
       start_period: 30s
       start_interval: 1s
 
+  server:
+    # 镜像多架构（amd64、arm64 同一个清单列表摘要）。镜像以非 root 用户 joplin 运行，不认 PUID/PGID；
+    # 笔记数据全部存在 Postgres 里，容器不需要挂数据目录。
+    image: joplin/server:3.7.5@sha256:2bf372c0eac43a3bd47440b7b3044feefe3423eb33649a836eb8d9499934b3b3
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_PORT: 22300
+      # Joplin 的网页、API 和用户内容可共用一个地址；single_host 让各入口的 Host 与它一致。
+      APP_BASE_URL: ${WONTON_EXTERNAL_URL:?核心没有注入对外地址}
+      DEFAULT_ADMIN_PASSWORD: ${WONTON_SECRET_CLIENT}
+      SIGNUP_ENABLED: "0"
+      DB_CLIENT: pg
+      # 容器时钟跟宿主机走，NTP 对时在插件网络里连不上（pool.ntp.org 解析不了，进程直接退出）。
+      # 上游文档的关法：MAX_TIME_DRIFT 设 0 跳过 NTP 检查。
+      MAX_TIME_DRIFT: "0"
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DATABASE: joplin
+      POSTGRES_USER: joplin
+      POSTGRES_PASSWORD: ${WONTON_SECRET_POSTGRES}
+      # 发信走核心的信箱（notify 权限）：注册确认、找回密码。核心的 SMTP 不加密、按来源认插件，
+      # 显式关掉 STARTTLS/TLS；不发用户名密码（nodemailer 会在明文连接上做 AUTH，反而失败）。
+      MAILER_ENABLED: "1"
+      MAILER_HOST: ${WONTON_SMTP_HOST}
+      MAILER_PORT: ${WONTON_SMTP_PORT}
+      MAILER_SECURITY: none
+      MAILER_NOREPLY_EMAIL: ${WONTON_MAIL_FROM}
+      MAILER_NOREPLY_NAME: Joplin
+    configs:
+      - source: setup-done
+        target: /app/setup-done.js
+    healthcheck:
+      # 镜像里没有 wget/curl，用 Node 自带的 http 模块检查真的能应答。
+      # Joplin 对每个请求做 origin 校验：请求自身的 host 必须等于 APP_BASE_URL 的 host
+      # （routeUtils.ts isValidOrigin），否则 /api/ping 都 404。容器内探测是 127.0.0.1，
+      # 要把 Host 头换成 APP_BASE_URL 的 host 才算健康的探针。
+      test: ["CMD", "node", "-e", "const u=new URL(process.env.APP_BASE_URL);require('http').get({host:'127.0.0.1',port:22300,path:'/api/ping',headers:{host:u.host}},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      start_interval: 5s
+
 configs:
-  site:
-    file: web/default.conf.template
-  page:
-    file: web/index.html
-  tokens:
-    file: web/tokens.css
+  setup-done:
+    file: setup-done.js
 
 x-wonton:
-  spec: "0.6"
-  # 换成你自己的：反向域名形式，装上以后不能改。
-  id: app.example.hello
-  version: 0.1.1
+  spec: "0.14"
+  id: org.joplinapp.joplin-server
+  version: 0.1.0
   kind: app
-  title: { zh: 你好, en: Hello }
-  description: { zh: 向登录的人问好的示例网页, en: An example page that greets whoever is signed in }
+  title: { zh: 笔记同步（Joplin）, en: Note Sync (Joplin) }
+  description: { zh: 像有道云笔记，你的笔记存在家里，手机和电脑上的 Joplin 笔记本之间自动同步, en: "Like a personal Evernote, your notes stay at home and sync between the Joplin apps on your phone and computer" }
   icon: icon.svg
   notices: [NOTICE]
-  screenshots: [screenshots/home.png]
-  author: { name: Example }
-  homepage: https://nginx.org
-  # 应用（这里是 nginx）的许可证；插件包自己的许可证写在仓库的 LICENSE 里。
-  license: BSD-2-Clause
+  screenshots: [screenshots/login.png, screenshots/home.png]
+  author: { name: geraldpeng6 }
+  homepage: https://joplinapp.org
+  # Joplin Server 只许个人使用（Joplin Server Personal Use License，不是开源许可证），全文见 NOTICE。
+  license: LicenseRef-Joplin-Server-Personal-Use
+  license_url: https://github.com/laurent22/joplin/blob/server-v3.7.5/packages/server/LICENSE.md
   tags:
-    zh: [工具]
-    en: [Tools]
+    zh: [笔记, 同步]
+    en: [Notes, Sync]
   about:
     zh: |
-      一个示例网页：登录以后，页面会向你问好。新建插件时可以照着改。
+      手机、电脑上的 Joplin 笔记本，笔记自动存到你家里的服务器，随时换设备接着写。
+
+      要配合免费的 Joplin 笔记本应用使用：先在手机或电脑上装 Joplin，然后在云吞里打开这个应用的客户端入口，
+      把显示的地址和你在 Joplin 里使用的账号、密码填进同步设置。
+
+      网页上是管理页，平时写笔记用 Joplin 应用就好。
     en: |
-      An example page: once you are signed in, the page says hello. Copy it as a starting point for a new plugin.
-  release_notes: { zh: 名字和说明更新。, en: Product name and description update. }
+      Your Joplin notebooks on your phone and computer sync through the server at home, so you can pick up any device and keep writing.
+
+      Works with the free Joplin app: install it on your phone or computer, enable this app's client entry in Wonton, then enter its address and your Joplin account credentials in the sync settings.
+
+      The web page is the admin console; for everyday notes, use the Joplin app.
+  release_notes: { zh: 使用统一的客户端入口，网页和笔记同步共用一个地址。, en: Use one canonical address for the web console and note sync through the client entry. }
+  setup:
+    zh: 在手机或电脑上安装 Joplin（joplinapp.org），同步设置里选 Joplin Server，填云吞显示的客户端地址。初始账号是 admin@localhost，初始密码在插件详情里查看；改过后用你在 Joplin 里设置的账号和密码。
+    en: Install Joplin (joplinapp.org), choose Joplin Server for sync, and use the client address shown in Wonton. The initial account is admin@localhost; view its initial password in the plugin details. Use your own Joplin credentials after changing them.
   webui:
-    service: web
-    port: 80
-    # 示例页回显网关注入的用户名，见 https://github.com/wontonapp/wonton-docs/blob/main/plugin-spec.md#网关代登录sso-proxy。
-    sso: proxy
-    proxy:
-      headers:
-        Remote-User: "{user}"
-  # 能放进侧边栏“我的应用”的页面，见 https://github.com/wontonapp/wonton-docs/blob/main/plugin-spec.md#应用页面tabs。放不放由用户决定。
-  tabs:
-    - id: home
-      title: { zh: 主页, en: Home }
-      icon: tabs/home.svg
-      icon_selected: tabs/home-fill.svg
-      path: /
-      # 这个页面没做适配，用默认的 inset：从状态栏下沿开始，页面不用管安全区。
-      # 想让内容从状态栏后面滚过，写 layout: edge-to-edge，并用 --wonton-inset-* 留出系统安全区的位置。
-  permissions: []
-  # 上游 nginx 官方镜像，amd64 和 arm64 都有；上游没写最低内存，按本机空闲实测取整（实测约 24M，取 64M）。
+    service: server
+    port: 22300
+    sso: none
+  clients:
+    http:
+      service: server
+      port: 22300
+      single_host: true
+      auth:
+        app:
+          setup_done: [node, /app/setup-done.js]
+      auth_failures:
+        - { path: /api/sessions, status: [403] }
+  secrets:
+    postgres:
+      generate: { bytes: 32 }
+    client:
+      generate: { bytes: 32 }
+      show_owner:
+        label: { zh: Joplin 初始密码, en: Initial Joplin password }
+  permissions:
+    - network.clients
+    # 发信（找回密码等）走核心的信箱。
+    - notify
+  # 上游没写最低内存；本机实测 server 常驻约 300M、Postgres 约 50M，取 512M。镜像 amd64、arm64 都有。
   requirements:
     arch: [amd64, arm64]
-    memory: 64M
+    memory: 512M

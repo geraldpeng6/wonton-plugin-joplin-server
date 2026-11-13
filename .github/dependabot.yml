@@ -5,3 +5,6 @@ updates:
     directory: /
     schedule:
       interval: daily
+    ignore:
+      - dependency-name: postgres
+        update-types: ["version-update:semver-major"]
